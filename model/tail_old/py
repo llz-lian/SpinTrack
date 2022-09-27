@@ -1,0 +1,68 @@
+class Tailattn(nn.Module):
+    def __init__(self,embed_dim,num_heads,drop_ratio,use_conv,use_weight,temp_len,target_len,check_point = True) -> None:
+        super().__init__()
+        self.check_point = check_point
+        self.cross = nn.MultiheadAttention(embed_dim,num_heads,batch_first=True)
+        self.temptarg_cross = nn.MultiheadAttention(embed_dim,num_heads,dropout=drop_ratio,batch_first=True)
+        self.targtemp_cross = nn.MultiheadAttention(embed_dim,num_heads,dropout=drop_ratio,batch_first=True)
+        self.temp_self = nn.MultiheadAttention(embed_dim,num_heads,dropout=drop_ratio,batch_first=True)
+        self.targ_self = nn.MultiheadAttention(embed_dim,num_heads,dropout=drop_ratio,batch_first=True)
+        self.weight = Weight(embed_dim,num_heads,temp_len**2,target_len**2,target_len**2,True)
+        self.temp_weight = Weight(embed_dim,num_heads,target_len**2,temp_len**2,temp_len**2,True)
+
+        self.weight2 = Weight(embed_dim,num_heads,temp_len**2,target_len**2,target_len**2,True)
+        self.temp_weight2 = Weight(embed_dim,num_heads,target_len**2,temp_len**2,temp_len**2,True)
+
+
+        self.temp_mlp = Mlp(embed_dim,4*embed_dim,embed_dim) if use_conv == False else ConvrepMlp(embed_dim,4*embed_dim)
+        self.targ_mlp = Mlp(embed_dim,4*embed_dim,embed_dim) if use_conv == False else ConvrepMlp(embed_dim,4*embed_dim)
+        self.temp_norm = nn.LayerNorm(embed_dim)
+        self.targ_norm = nn.LayerNorm(embed_dim)
+
+        self.temp_endmlp = Mlp(embed_dim,4*embed_dim,embed_dim) if use_conv == False else ConvrepMlp(embed_dim,4*embed_dim)
+        self.targ_endmlp = Mlp(embed_dim,4*embed_dim,embed_dim) if use_conv == False else ConvrepMlp(embed_dim,4*embed_dim)
+        self.temp_endnorm = nn.LayerNorm(embed_dim)
+        self.targ_endnorm = nn.LayerNorm(embed_dim)
+
+        self.targ_selfmlp = Mlp(embed_dim,4*embed_dim,embed_dim) if use_conv == False else ConvrepMlp(embed_dim,4*embed_dim)
+        self.targ_selfnorm = nn.LayerNorm(embed_dim)
+
+        hanning = np.hanning(temp_len)
+        self.window = torch.from_numpy(np.outer(hanning,hanning)).float().flatten().unsqueeze(-1)
+        #self.window[self.window<0.7] = 0
+    def forward(self,temp,target):
+        #weight1
+        target_ = target
+        temp_ = temp.mul(self.window)
+        target,ttt = cp.checkpoint(self.weight,temp_,target,target)
+        temp,tett = self.temp_weight(target_,temp_,temp_)
+
+        #temp self
+        temp__,tempself =  self.temp_self(query = temp,key = temp,value = temp)
+        temp = temp + temp__
+        temp = temp + self.temp_endmlp(self.temp_endnorm(temp))
+        #target self
+        target__,tagself =  cp.checkpoint(self.targ_self,target,target,target)
+        target = target + target__
+        target = target + self.targ_selfmlp(self.targ_selfnorm(target)) 
+
+        #weight2
+        target_ = target
+        temp_ = temp.mul(self.window)
+        target,ttt2 = cp.checkpoint(self.weight2,temp_,target,target)
+        temp,tett2 = self.temp_weight2(target_,temp_,temp_)
+
+        temp_ = temp
+        #temp target
+        temp__,tat =  cp.checkpoint(self.temptarg_cross, temp,target,target)
+        temp = temp + temp__
+        temp = temp + self.temp_mlp(self.temp_norm(temp))#256,288
+       
+        #target temp
+        target = target + self.targtemp_cross(query = target,key = temp_,value = temp_)[0]
+        target = target + self.targ_endmlp(self.targ_endnorm(target))#484,288
+
+        #temp target
+        out ,weight = self.cross(query = target,key = temp,value = temp)#256
+        out = target + self.targ_mlp(self.targ_norm(out))
+        return out,tagself
